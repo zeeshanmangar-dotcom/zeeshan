@@ -1,10 +1,7 @@
 import streamlit as st
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.llms import HuggingFaceHub
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
 from langchain.schema import HumanMessage, AIMessage
 import pymupdf  # PyMuPDF for PDF processing
 import tempfile
@@ -51,9 +48,6 @@ if "chat_history" not in st.session_state:
 
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
-
-if "conversation_chain" not in st.session_state:
-    st.session_state.conversation_chain = None
 
 if "processed_files" not in st.session_state:
     st.session_state.processed_files = []
@@ -259,7 +253,7 @@ if prompt := st.chat_input("Ask a question about your PDFs...", disabled=(st.ses
                 try:
                     # Retrieve relevant documents
                     retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
-                    docs = retriever.get_relevant_documents(prompt)
+                    docs = retriever.invoke(prompt)
                     
                     # Combine context from retrieved documents
                     context = "\n\n".join([doc.page_content for doc in docs])
