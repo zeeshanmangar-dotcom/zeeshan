@@ -1,11 +1,11 @@
 import streamlit as st
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.schema import HumanMessage, AIMessage
 import pymupdf  # PyMuPDF for PDF processing
 import tempfile
 import os
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from transformers import pipeline
+import re
 
 # Page configuration
 st.set_page_config(
@@ -17,7 +17,7 @@ st.set_page_config(
 st.title("📚 PDF Chat Assistant")
 st.markdown("""
 Upload one or more PDF files and chat with an AI assistant about their content.
-The assistant uses RAG (Retrieval-Augmented Generation) with free, open-source models to provide accurate answers based on your documents.
+The assistant uses semantic search to find relevant content and answer your questions.
 """)
 
 # Sidebar for file upload
@@ -36,101 +36,139 @@ with st.sidebar:
     st.markdown("---")
     st.info("""
     **Note:** This app uses free, open-source models:
-    - Embeddings: sentence-transformers/all-MiniLM-L6-v2
-    - LLM: Google Flan-T5 (running locally)
+    - Embeddings: all-MiniLM-L6-v2
+    - LLM: Google Flan-T5
     
-    No API key required! The first run may take a moment to download models.
+    No API key required!
     """)
 
 # Initialize session state
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-
-if "processed_files" not in st.session_state:
-    st.session_state.processed_files = []
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
 
 if "embeddings" not in st.session_state:
     st.session_state.embeddings = None
 
-if "llm" not in st.session_state:
-    st.session_state.llm = None
+if "processed_files" not in st.session_state:
+    st.session_state.processed_files = []
+
+if "model" not in st.session_state:
+    st.session_state.model = None
+
+if "qa_pipeline" not in st.session_state:
+    st.session_state.qa_pipeline = None
 
 
 @st.cache_resource
-def load_embeddings():
+def load_embedding_model():
     """Load and cache the embedding model."""
     try:
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
-        )
-        return embeddings
+        model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+        return model
     except Exception as e:
         st.error(f"Error loading embeddings: {str(e)}")
         return None
 
 
 @st.cache_resource
-def load_llm():
-    """Load and cache the language model."""
+def load_qa_model():
+    """Load and cache the QA model."""
     try:
-        from transformers import pipeline
-        
-        # Use a smaller, local model for faster inference
-        qa_pipeline = pipeline(
+        qa = pipeline(
             "text2text-generation",
             model="google/flan-t5-base",
             max_length=512,
-            device=-1  # CPU
+            device=-1
         )
-        
-        return qa_pipeline
+        return qa
     except Exception as e:
-        st.error(f"Error loading LLM: {str(e)}")
+        st.error(f"Error loading QA model: {str(e)}")
         return None
 
 
 def extract_text_from_pdf(pdf_file):
     """Extract text from a PDF file using PyMuPDF."""
     try:
-        # Create a temporary file to save the uploaded PDF
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file.write(pdf_file.getvalue())
             tmp_path = tmp_file.name
         
-        # Open and extract text from PDF
         doc = pymupdf.open(tmp_path)
         text = ""
         for page in doc:
             text += page.get_text()
         doc.close()
         
-        # Clean up temporary file
         os.unlink(tmp_path)
-        
         return text
     except Exception as e:
         st.error(f"Error extracting text from {pdf_file.name}: {str(e)}")
         return ""
 
 
-def process_pdfs(files, embeddings):
-    """Process uploaded PDF files and create vector store."""
+def split_text(text, chunk_size=500, overlap=50):
+    """Split text into chunks."""
+    chunks = []
+    start = 0
+    text_len = len(text)
+    
+    while start < text_len:
+        end = start + chunk_size
+        chunk = text[start:end]
+        
+        # Try to break at sentence boundary
+        if end < text_len:
+            last_period = chunk.rfind('.')
+            last_newline = chunk.rfind('\n')
+            break_point = max(last_period, last_newline)
+            
+            if break_point > chunk_size // 2:
+                chunk = chunk[:break_point + 1]
+                end = start + break_point + 1
+        
+        if chunk.strip():
+            chunks.append(chunk.strip())
+        
+        start = end - overlap
+    
+    return chunks
+
+
+def cosine_similarity(a, b):
+    """Calculate cosine similarity between two vectors."""
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+
+def find_relevant_chunks(query, chunks, embeddings, model, top_k=3):
+    """Find most relevant chunks for a query."""
+    query_embedding = model.encode([query])[0]
+    
+    similarities = []
+    for i, chunk_emb in enumerate(embeddings):
+        sim = cosine_similarity(query_embedding, chunk_emb)
+        similarities.append((i, sim))
+    
+    similarities.sort(key=lambda x: x[1], reverse=True)
+    top_indices = [idx for idx, _ in similarities[:top_k]]
+    
+    return [chunks[i] for i in top_indices]
+
+
+def process_pdfs(files, model):
+    """Process uploaded PDF files."""
     if not files:
         st.error("⚠️ Please upload at least one PDF file.")
         return None
     
-    if embeddings is None:
+    if model is None:
         st.error("⚠️ Embedding model failed to load.")
         return None
     
     try:
         with st.spinner("Processing PDFs... This may take a moment."):
-            # Extract text from all PDFs
             all_text = ""
             file_names = []
             
@@ -140,32 +178,25 @@ def process_pdfs(files, embeddings):
                     all_text += f"\n\n--- Content from {file.name} ---\n\n{text}"
                     file_names.append(file.name)
                 else:
-                    st.warning(f"⚠️ No text extracted from {file.name}. It might be empty or image-based.")
+                    st.warning(f"⚠️ No text extracted from {file.name}.")
             
             if not all_text.strip():
                 st.error("❌ No text could be extracted from the uploaded PDFs.")
                 return None
             
-            # Split text into chunks
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=500,
-                chunk_overlap=50,
-                length_function=len,
-                separators=["\n\n", "\n", " ", ""]
-            )
-            chunks = text_splitter.split_text(all_text)
+            chunks = split_text(all_text)
             
             if not chunks:
                 st.error("❌ Could not split text into chunks.")
                 return None
             
-            # Create vector store
-            vectorstore = FAISS.from_texts(chunks, embeddings)
+            # Create embeddings
+            embeddings = model.encode(chunks)
             
             st.success(f"✅ Successfully processed {len(file_names)} PDF(s): {', '.join(file_names)}")
-            st.info(f"📊 Created {len(chunks)} text chunks for retrieval.")
+            st.info(f"📊 Created {len(chunks)} text chunks.")
             
-            return vectorstore, file_names
+            return chunks, embeddings, file_names
     
     except Exception as e:
         st.error(f"❌ Error processing PDFs: {str(e)}")
@@ -175,7 +206,6 @@ def process_pdfs(files, embeddings):
 def generate_answer(question, context, qa_pipeline):
     """Generate an answer using the QA pipeline."""
     try:
-        # Format the prompt for the model
         prompt = f"""Answer the question based on the context below. If the answer cannot be found in the context, say "I cannot find the answer in the provided documents."
 
 Context: {context}
@@ -184,7 +214,6 @@ Question: {question}
 
 Answer:"""
         
-        # Generate answer
         result = qa_pipeline(prompt, max_length=512, do_sample=False)
         answer = result[0]['generated_text']
         
@@ -193,57 +222,49 @@ Answer:"""
         return f"Error generating answer: {str(e)}"
 
 
-# Load models on first run
-if st.session_state.embeddings is None:
-    with st.spinner("Loading embedding model... (first time only)"):
-        st.session_state.embeddings = load_embeddings()
+# Load models
+if st.session_state.model is None:
+    with st.spinner("Loading embedding model..."):
+        st.session_state.model = load_embedding_model()
 
-if st.session_state.llm is None:
-    with st.spinner("Loading language model... (first time only)"):
-        st.session_state.llm = load_llm()
+if st.session_state.qa_pipeline is None:
+    with st.spinner("Loading language model..."):
+        st.session_state.qa_pipeline = load_qa_model()
 
-# Process PDFs when button is clicked
+# Process PDFs
 if process_button:
-    result = process_pdfs(uploaded_files, st.session_state.embeddings)
+    result = process_pdfs(uploaded_files, st.session_state.model)
     if result:
-        st.session_state.vectorstore, st.session_state.processed_files = result
-        # Clear chat history when processing new PDFs
+        st.session_state.chunks, st.session_state.embeddings, st.session_state.processed_files = result
         st.session_state.chat_history = []
 
 # Main chat interface
 st.markdown("---")
 
-# Display instructions if no PDFs processed
-if st.session_state.vectorstore is None:
+if not st.session_state.chunks:
     st.info("""
     👈 **Get Started:**
     1. Upload one or more PDF files
     2. Click "Process PDFs"
     3. Start chatting about your documents!
-    
-    ⚡ **Note:** The first run will download required models (~400MB). This happens once and future runs will be faster.
     """)
 else:
     st.success(f"📄 Currently chatting about: {', '.join(st.session_state.processed_files)}")
 
 # Display chat history
 for message in st.session_state.chat_history:
-    if isinstance(message, HumanMessage):
-        with st.chat_message("user"):
-            st.markdown(message.content)
-    elif isinstance(message, AIMessage):
-        with st.chat_message("assistant"):
-            st.markdown(message.content)
+    role, content = message
+    with st.chat_message(role):
+        st.markdown(content)
 
 # Chat input
-if prompt := st.chat_input("Ask a question about your PDFs...", disabled=(st.session_state.vectorstore is None)):
-    if st.session_state.llm is None:
-        st.error("⚠️ Language model failed to load. Please refresh the page.")
+if prompt := st.chat_input("Ask a question about your PDFs...", disabled=(not st.session_state.chunks)):
+    if st.session_state.qa_pipeline is None:
+        st.error("⚠️ Language model failed to load.")
     else:
-        # Add user message to chat history
-        st.session_state.chat_history.append(HumanMessage(content=prompt))
+        # Add user message
+        st.session_state.chat_history.append(("user", prompt))
         
-        # Display user message
         with st.chat_message("user"):
             st.markdown(prompt)
         
@@ -251,26 +272,25 @@ if prompt := st.chat_input("Ask a question about your PDFs...", disabled=(st.ses
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    # Retrieve relevant documents
-                    retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
-                    docs = retriever.invoke(prompt)
+                    # Find relevant chunks
+                    relevant_chunks = find_relevant_chunks(
+                        prompt,
+                        st.session_state.chunks,
+                        st.session_state.embeddings,
+                        st.session_state.model,
+                        top_k=3
+                    )
                     
-                    # Combine context from retrieved documents
-                    context = "\n\n".join([doc.page_content for doc in docs])
+                    context = "\n\n".join(relevant_chunks)
+                    answer = generate_answer(prompt, context, st.session_state.qa_pipeline)
                     
-                    # Generate answer
-                    answer = generate_answer(prompt, context, st.session_state.llm)
-                    
-                    # Display answer
                     st.markdown(answer)
-                    
-                    # Add assistant message to chat history
-                    st.session_state.chat_history.append(AIMessage(content=answer))
+                    st.session_state.chat_history.append(("assistant", answer))
                     
                 except Exception as e:
-                    error_message = f"❌ Error generating response: {str(e)}"
+                    error_message = f"❌ Error: {str(e)}"
                     st.error(error_message)
-                    st.session_state.chat_history.append(AIMessage(content=error_message))
+                    st.session_state.chat_history.append(("assistant", error_message))
 
 # Clear chat button
 if st.session_state.chat_history:
