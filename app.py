@@ -4,7 +4,7 @@ import os
 import re
 import numpy as np
 
-# Lazy imports to handle missing packages gracefully
+# Lazy imports to handle missing packages gracefull
 try:
     import pymupdf
     PYMUPDF_AVAILABLE = True
