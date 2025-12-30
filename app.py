@@ -2,80 +2,89 @@ import os
 import streamlit as st
 from typing import List
 from PyPDF2 import PdfReader
+
 from openai import OpenAI
 
+# ✅ FIXED IMPORT (LangChain v0.2+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain.embeddings.base import Embeddings
 
 # =========================
-# Page Config
+# Page Configuration
 # =========================
 st.set_page_config(
-    page_title="PDF Chatbot (HF RAG)",
+    page_title="PDF Chatbot (RAG – HF Router)",
     page_icon="📄🤖",
     layout="wide"
 )
 
 # =========================
-# HF OpenAI-Compatible Client
+# HuggingFace OpenAI-Compatible Client
 # =========================
-def get_client(hf_token: str) -> OpenAI:
+def get_hf_client(hf_token: str) -> OpenAI:
     return OpenAI(
         base_url="https://router.huggingface.co/v1",
         api_key=hf_token,
     )
 
 # =========================
-# HF Embeddings (NO sentence-transformers)
+# Custom Embeddings via HF Router
 # =========================
 class HFEmbeddings(Embeddings):
-    def __init__(self, client: OpenAI):
+    def __init__(self, client: OpenAI, model: str):
         self.client = client
+        self.model = model
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        response = self.client.embeddings.create(
-            model="intfloat/e5-small-v2",
-            input=texts
-        )
-        return [e.embedding for e in response.data]
+        vectors = []
+        for text in texts:
+            resp = self.client.embeddings.create(
+                model=self.model,
+                input=text
+            )
+            vectors.append(resp.data[0].embedding)
+        return vectors
 
     def embed_query(self, text: str) -> List[float]:
-        response = self.client.embeddings.create(
-            model="intfloat/e5-small-v2",
+        resp = self.client.embeddings.create(
+            model=self.model,
             input=text
         )
-        return response.data[0].embedding
+        return resp.data[0].embedding
 
 # =========================
-# PDF Processing
+# PDF Utilities
 # =========================
-def extract_text(files) -> str:
-    text = []
-    for f in files:
-        reader = PdfReader(f)
+def extract_text_from_pdfs(pdf_files: List) -> str:
+    text_data = []
+    for pdf in pdf_files:
+        reader = PdfReader(pdf)
         for page in reader.pages:
-            if page.extract_text():
-                text.append(page.extract_text())
-    return "\n".join(text)
+            text = page.extract_text()
+            if text:
+                text_data.append(text)
+    return "\n".join(text_data)
 
-def build_vectorstore(text: str, client: OpenAI):
+def build_vectorstore(text: str, client: OpenAI) -> FAISS:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200
     )
     chunks = splitter.split_text(text)
-    embeddings = HFEmbeddings(client)
+
+    embeddings = HFEmbeddings(
+        client=client,
+        model="sentence-transformers/all-MiniLM-L6-v2"
+    )
+
     return FAISS.from_texts(chunks, embeddings)
 
-# =========================
-# RAG Answer
-# =========================
-def answer_question(client, context, history, question):
+def generate_answer(client: OpenAI, context: List[str], history, question: str) -> str:
     messages = [
         {
             "role": "system",
-            "content": "Answer ONLY using the provided context. If the answer is not present, say you don't know."
+            "content": "Answer ONLY using the provided context. If not found, say you don't know."
         }
     ]
 
@@ -85,7 +94,7 @@ def answer_question(client, context, history, question):
 
     messages.append({
         "role": "user",
-        "content": f"Context:\n{context}\n\nQuestion:\n{question}"
+        "content": f"Context:\n{chr(10).join(context)}\n\nQuestion:\n{question}"
     })
 
     completion = client.chat.completions.create(
@@ -100,68 +109,93 @@ def answer_question(client, context, history, question):
 # =========================
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
-if "history" not in st.session_state:
-    st.session_state.history = []
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 if "client" not in st.session_state:
     st.session_state.client = None
 
 # =========================
 # Sidebar
 # =========================
-st.sidebar.title("🔑 HuggingFace Token")
-hf_token = st.sidebar.text_input("HF_TOKEN", type="password")
+st.sidebar.title("🔑 HuggingFace API")
+hf_token = st.sidebar.text_input("Enter HF_TOKEN", type="password")
 
-pdfs = st.sidebar.file_uploader(
+st.sidebar.markdown("---")
+pdf_files = st.sidebar.file_uploader(
     "Upload PDFs",
     type=["pdf"],
     accept_multiple_files=True
 )
 
-if st.sidebar.button("Process PDFs"):
-    if not hf_token or not pdfs:
-        st.error("HF_TOKEN and PDFs required")
-    else:
-        with st.spinner("Processing PDFs..."):
-            client = get_client(hf_token)
-            text = extract_text(pdfs)
-
-            if not text.strip():
-                st.error("No text found in PDFs.")
-            else:
-                st.session_state.vectorstore = build_vectorstore(text, client)
-                st.session_state.client = client
-                st.session_state.history = []
-                st.success("PDFs indexed successfully!")
+process_btn = st.sidebar.button("Process PDFs")
 
 # =========================
 # Main UI
 # =========================
-st.title("📄🤖 Chat with PDFs (RAG)")
+st.title("📄🤖 Chat with PDFs (RAG – HuggingFace)")
+st.markdown("""
+**Steps**
+1. Enter HuggingFace `HF_TOKEN`
+2. Upload PDFs
+3. Click **Process PDFs**
+4. Ask questions, summaries, or explanations
+""")
 
-for q, a in st.session_state.history:
+# =========================
+# Process PDFs
+# =========================
+if process_btn:
+    if not hf_token:
+        st.error("HF_TOKEN is required.")
+    elif not pdf_files:
+        st.error("Upload at least one PDF.")
+    else:
+        with st.spinner("Indexing PDFs..."):
+            os.environ["HF_TOKEN"] = hf_token
+            client = get_hf_client(hf_token)
+
+            text = extract_text_from_pdfs(pdf_files)
+            if not text.strip():
+                st.error("No readable text found.")
+            else:
+                st.session_state.vectorstore = build_vectorstore(text, client)
+                st.session_state.client = client
+                st.session_state.chat_history = []
+                st.success("PDFs processed successfully!")
+
+# =========================
+# Chat UI
+# =========================
+st.markdown("---")
+st.subheader("💬 Chat")
+
+for q, a in st.session_state.chat_history:
     with st.chat_message("user"):
         st.markdown(q)
     with st.chat_message("assistant"):
         st.markdown(a)
 
-query = st.chat_input("Ask a question about the PDFs...")
+query = st.chat_input("Ask about the PDFs...")
 
 if query:
-    if not st.session_state.vectorstore:
-        st.error("Please upload and process PDFs first.")
+    if st.session_state.vectorstore is None:
+        st.error("Please process PDFs first.")
     else:
+        with st.chat_message("user"):
+            st.markdown(query)
+
         with st.spinner("Thinking..."):
             docs = st.session_state.vectorstore.similarity_search(query, k=4)
-            context = "\n\n".join(d.page_content for d in docs)
+            context = [d.page_content for d in docs]
 
-            answer = answer_question(
-                st.session_state.client,
-                context,
-                st.session_state.history,
-                query
+            answer = generate_answer(
+                client=st.session_state.client,
+                context=context,
+                history=st.session_state.chat_history,
+                question=query
             )
-
-        st.session_state.history.append((query, answer))
 
         with st.chat_message("assistant"):
             st.markdown(answer)
+
+        st.session_state.chat_history.append((query, answer))
