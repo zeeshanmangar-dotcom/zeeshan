@@ -1,328 +1,274 @@
 import streamlit as st
 import tempfile
 import os
-import re
 import numpy as np
+from typing import List, Tuple
 
-# Lazy imports to handle missing packages gracefull
+# Lazy imports with graceful fallbacks
 try:
-    import pymupdf
+    import pymupdf  # PyMuPDF
     PYMUPDF_AVAILABLE = True
 except ImportError:
     PYMUPDF_AVAILABLE = False
-    
+
 try:
     from sentence_transformers import SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
-    
+
 try:
     from transformers import pipeline
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
 
-# Page configuration
+# ========================= Page Config =========================
 st.set_page_config(
     page_title="PDF Chat Assistant",
     page_icon="📚",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 st.title("📚 PDF Chat Assistant")
-st.markdown("""
-Upload one or more PDF files and chat with an AI assistant about their content.
-The assistant uses semantic search to find relevant content and answer your questions.
-""")
+st.markdown(
+    """
+Upload one or more PDF files and ask questions about their content.  
+The assistant uses **semantic search** over document chunks and a local LLM to answer your questions — no API keys needed!
+"""
+)
 
-# Check dependencies
+# ========================= Dependency Check =========================
 if not all([PYMUPDF_AVAILABLE, SENTENCE_TRANSFORMERS_AVAILABLE, TRANSFORMERS_AVAILABLE]):
-    st.error("⚠️ Missing required packages. Please ensure all dependencies are installed.")
+    st.error("⚠️ Missing required packages. Install them with:")
+    st.code(
+        "pip install pymupdf sentence-transformers transformers torch",
+        language="bash",
+    )
     missing = []
     if not PYMUPDF_AVAILABLE:
-        missing.append("PyMuPDF")
+        missing.append("pymupdf")
     if not SENTENCE_TRANSFORMERS_AVAILABLE:
         missing.append("sentence-transformers")
     if not TRANSFORMERS_AVAILABLE:
         missing.append("transformers")
-    st.error(f"Missing: {', '.join(missing)}")
+    st.error(f"Missing packages: {', '.join(missing)}")
     st.stop()
 
-# Sidebar for file upload
+# ========================= Sidebar =========================
 with st.sidebar:
-    st.header("Upload PDFs")
+    st.header("📄 Upload PDFs")
     uploaded_files = st.file_uploader(
         "Choose PDF files",
-        type="pdf",
+        type=["pdf"],
         accept_multiple_files=True,
-        help="Upload one or more PDF files to chat about"
+        help="You can upload multiple PDFs at once",
     )
-    
-    # Process button
+
     process_button = st.button("Process PDFs", type="primary", use_container_width=True)
-    
+
     st.markdown("---")
-    st.info("""
-    **Note:** This app uses free, open-source models:
-    - Embeddings: all-MiniLM-L6-v2
-    - LLM: Google Flan-T5
-    
-    No API key required!
-    """)
+    st.caption(
+        """
+        **Models Used**  
+        • Embeddings: `all-MiniLM-L6-v2` (fast & lightweight)  
+        • LLM: `google/flan-t5-base` (runs locally)  
+        
+        Fully offline after initial download — no data leaves your machine.
+        """
+    )
 
-# Initialize session state
+# ========================= Session State Initialization =========================
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
+    st.session_state.chat_history: List[Tuple[str, str]] = []
 if "chunks" not in st.session_state:
-    st.session_state.chunks = []
-
+    st.session_state.chunks: List[str] = []
 if "embeddings" not in st.session_state:
     st.session_state.embeddings = None
-
 if "processed_files" not in st.session_state:
-    st.session_state.processed_files = []
-
-if "model" not in st.session_state:
-    st.session_state.model = None
-
+    st.session_state.processed_files: List[str] = []
+if "embedding_model" not in st.session_state:
+    st.session_state.embedding_model = None
 if "qa_pipeline" not in st.session_state:
     st.session_state.qa_pipeline = None
 
+# ========================= Model Loading (Cached) =========================
+@st.cache_resource(show_spinner="Loading embedding model...")
+def load_embedding_model() -> SentenceTransformer:
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-@st.cache_resource
-def load_embedding_model():
-    """Load and cache the embedding model."""
+@st.cache_resource(show_spinner="Loading QA model (this may take a minute)...")
+def load_qa_pipeline():
+    return pipeline(
+        "text2text-generation",
+        model="google/flan-t5-base",  # You can upgrade to 'flan-t5-large' or 'flan-t5-xl' if VRAM allows
+        max_new_tokens=256,
+        temperature=0.0,
+        do_sample=False,
+        device=-1,  # CPU; change to 0 for GPU if available
+    )
+
+# Load models if not already
+if st.session_state.embedding_model is None:
+    st.session_state.embedding_model = load_embedding_model()
+
+if st.session_state.qa_pipeline is None:
+    st.session_state.qa_pipeline = load_qa_pipeline()
+
+# ========================= PDF Processing Functions =========================
+def extract_text_from_pdf(pdf_bytes: bytes, filename: str) -> str:
+    """Extract text from PDF bytes using PyMuPDF."""
     try:
-        model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-        return model
-    except Exception as e:
-        st.error(f"Error loading embeddings: {str(e)}")
-        return None
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
 
-
-@st.cache_resource
-def load_qa_model():
-    """Load and cache the QA model."""
-    try:
-        qa = pipeline(
-            "text2text-generation",
-            model="google/flan-t5-base",
-            max_length=512,
-            device=-1
-        )
-        return qa
-    except Exception as e:
-        st.error(f"Error loading QA model: {str(e)}")
-        return None
-
-
-def extract_text_from_pdf(pdf_file):
-    """Extract text from a PDF file using PyMuPDF."""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(pdf_file.getvalue())
-            tmp_path = tmp_file.name
-        
         doc = pymupdf.open(tmp_path)
-        text = ""
-        for page in doc:
-            text += page.get_text()
+        text = "\n".join(page.get_text() for page in doc)
         doc.close()
-        
         os.unlink(tmp_path)
-        return text
+        return text.strip()
     except Exception as e:
-        st.error(f"Error extracting text from {pdf_file.name}: {str(e)}")
+        st.error(f"Failed to extract text from {filename}: {e}")
         return ""
 
+def recursive_chunk_text(text: str, chunk_size: int = 800, chunk_overlap: int = 100) -> List[str]:
+    """Better chunking: splits on sentence/paragraph boundaries when possible."""
+    separators = ["\n\n", "\n", ". ", "? ", "! "]
+    chunks = [text]
 
-def split_text(text, chunk_size=500, overlap=50):
-    """Split text into chunks."""
-    chunks = []
-    start = 0
-    text_len = len(text)
-    
-    while start < text_len:
-        end = start + chunk_size
-        chunk = text[start:end]
-        
-        # Try to break at sentence boundary
-        if end < text_len:
-            last_period = chunk.rfind('.')
-            last_newline = chunk.rfind('\n')
-            break_point = max(last_period, last_newline)
-            
-            if break_point > chunk_size // 2:
-                chunk = chunk[:break_point + 1]
-                end = start + break_point + 1
-        
-        if chunk.strip():
-            chunks.append(chunk.strip())
-        
-        start = end - overlap
-    
-    return chunks
+    for sep in separators:
+        new_chunks = []
+        for chunk in chunks:
+            if len(chunk) <= chunk_size:
+                new_chunks.append(chunk)
+            else:
+                parts = chunk.split(sep)
+                current = ""
+                for part in parts:
+                    if len(current + part + sep) <= chunk_size:
+                        current += (part + sep) if current else part
+                    else:
+                        if current:
+                            new_chunks.append(current.strip())
+                        current = part
+                if current:
+                    new_chunks.append(current.strip())
+        chunks = new_chunks
+        if all(len(c) <= chunk_size for c in chunks):
+            break
 
+    # Overlap handling
+    final_chunks = []
+    for i, chunk in enumerate(chunks):
+        final_chunks.append(chunk)
+        if i < len(chunks) - 1:
+            overlap_start = max(0, len(chunk) - chunk_overlap)
+            final_chunks.append(chunk[overlap_start:])
 
-def cosine_similarity(a, b):
-    """Calculate cosine similarity between two vectors."""
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    return [c.strip() for c in final_chunks if c.strip()]
 
+def compute_embeddings(chunks: List[str], model: SentenceTransformer):
+    """Compute and cache embeddings."""
+    with st.spinner(f"Computing embeddings for {len(chunks)} chunks..."):
+        return model.encode(chunks, normalize_embeddings=True)
 
-def find_relevant_chunks(query, chunks, embeddings, model, top_k=3):
-    """Find most relevant chunks for a query."""
-    query_embedding = model.encode([query])[0]
-    
-    similarities = []
-    for i, chunk_emb in enumerate(embeddings):
-        sim = cosine_similarity(query_embedding, chunk_emb)
-        similarities.append((i, sim))
-    
-    similarities.sort(key=lambda x: x[1], reverse=True)
-    top_indices = [idx for idx, _ in similarities[:top_k]]
-    
+def find_relevant_chunks(query: str, chunks: List[str], embeddings, model, top_k: int = 4) -> List[str]:
+    query_emb = model.encode([query], normalize_embeddings=True)[0]
+    similarities = np.dot(embeddings, query_emb)
+    top_indices = np.argsort(similarities)[-top_k:][::-1]
     return [chunks[i] for i in top_indices]
 
+def generate_answer(question: str, context: str, qa_pipeline) -> str:
+    prompt = f"""Based only on the following context, answer the question concisely. 
+If the answer is not present, respond with "I don't know based on the provided documents."
 
-def process_pdfs(files, model):
-    """Process uploaded PDF files."""
-    if not files:
-        st.error("⚠️ Please upload at least one PDF file.")
-        return None
-    
-    if model is None:
-        st.error("⚠️ Embedding model failed to load.")
-        return None
-    
-    try:
-        with st.spinner("Processing PDFs... This may take a moment."):
-            all_text = ""
-            file_names = []
-            
-            for file in files:
-                text = extract_text_from_pdf(file)
-                if text.strip():
-                    all_text += f"\n\n--- Content from {file.name} ---\n\n{text}"
-                    file_names.append(file.name)
-                else:
-                    st.warning(f"⚠️ No text extracted from {file.name}.")
-            
-            if not all_text.strip():
-                st.error("❌ No text could be extracted from the uploaded PDFs.")
-                return None
-            
-            chunks = split_text(all_text)
-            
-            if not chunks:
-                st.error("❌ Could not split text into chunks.")
-                return None
-            
-            # Create embeddings
-            embeddings = model.encode(chunks)
-            
-            st.success(f"✅ Successfully processed {len(file_names)} PDF(s): {', '.join(file_names)}")
-            st.info(f"📊 Created {len(chunks)} text chunks.")
-            
-            return chunks, embeddings, file_names
-    
-    except Exception as e:
-        st.error(f"❌ Error processing PDFs: {str(e)}")
-        return None
-
-
-def generate_answer(question, context, qa_pipeline):
-    """Generate an answer using the QA pipeline."""
-    try:
-        prompt = f"""Answer the question based on the context below. If the answer cannot be found in the context, say "I cannot find the answer in the provided documents."
-
-Context: {context}
+Context:
+{context}
 
 Question: {question}
 
 Answer:"""
-        
-        result = qa_pipeline(prompt, max_length=512, do_sample=False)
-        answer = result[0]['generated_text']
-        
-        return answer
+
+    try:
+        result = qa_pipeline(prompt)[0]["generated_text"]
+        # Clean up common FLAN-T5 artifacts
+        return result.strip()
     except Exception as e:
-        return f"Error generating answer: {str(e)}"
+        return f"Error during generation: {e}"
 
+# ========================= Process PDFs =========================
+if process_button and uploaded_files:
+    all_text = ""
+    processed_names = []
 
-# Load models
-if st.session_state.model is None:
-    with st.spinner("Loading embedding model..."):
-        st.session_state.model = load_embedding_model()
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
-if st.session_state.qa_pipeline is None:
-    with st.spinner("Loading language model..."):
-        st.session_state.qa_pipeline = load_qa_model()
+    for i, file in enumerate(uploaded_files):
+        status_text.text(f"Extracting text from {file.name}...")
+        text = extract_text_from_pdf(file.getvalue(), file.name)
+        if text:
+            all_text += f"\n\n--- Document: {file.name} ---\n\n{text}"
+            processed_names.append(file.name)
+        progress_bar.progress((i + 1) / len(uploaded_files))
 
-# Process PDFs
-if process_button:
-    result = process_pdfs(uploaded_files, st.session_state.model)
-    if result:
-        st.session_state.chunks, st.session_state.embeddings, st.session_state.processed_files = result
-        st.session_state.chat_history = []
+    status_text.text("Chunking text...")
+    st.session_state.chunks = recursive_chunk_text(all_text, chunk_size=800, chunk_overlap=100)
 
-# Main chat interface
+    if not st.session_state.chunks:
+        st.error("No text chunks created. Please check your PDFs.")
+        st.stop()
+
+    status_text.text("Generating embeddings...")
+    st.session_state.embeddings = compute_embeddings(st.session_state.chunks, st.session_state.embedding_model)
+    st.session_state.processed_files = processed_names
+
+    st.session_state.chat_history = []  # Reset chat on new documents
+    progress_bar.empty()
+    status_text.empty()
+
+    st.success(f"✅ Processed {len(processed_names)} PDF(s): {', '.join(processed_names)}")
+    st.info(f"📊 Created {len(st.session_state.chunks)} chunks for retrieval.")
+
+# ========================= Main Chat Interface =========================
 st.markdown("---")
 
 if not st.session_state.chunks:
-    st.info("""
-    👈 **Get Started:**
-    1. Upload one or more PDF files
-    2. Click "Process PDFs"
-    3. Start chatting about your documents!
-    """)
+    st.info("👈 Upload PDF files in the sidebar and click **Process PDFs** to begin chatting!")
 else:
-    st.success(f"📄 Currently chatting about: {', '.join(st.session_state.processed_files)}")
+    st.success(f"📄 Active documents: {', '.join(st.session_state.processed_files)}")
 
-# Display chat history
-for message in st.session_state.chat_history:
-    role, content = message
-    with st.chat_message(role):
-        st.markdown(content)
+    # Display chat history
+    for role, message in st.session_state.chat_history:
+        with st.chat_message(role):
+            st.markdown(message)
 
-# Chat input
-if prompt := st.chat_input("Ask a question about your PDFs...", disabled=(not st.session_state.chunks)):
-    if st.session_state.qa_pipeline is None:
-        st.error("⚠️ Language model failed to load.")
-    else:
+    # Chat input
+    if prompt := st.chat_input("Ask a question about the uploaded PDFs..."):
         # Add user message
         st.session_state.chat_history.append(("user", prompt))
-        
         with st.chat_message("user"):
             st.markdown(prompt)
-        
-        # Generate response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    # Find relevant chunks
-                    relevant_chunks = find_relevant_chunks(
-                        prompt,
-                        st.session_state.chunks,
-                        st.session_state.embeddings,
-                        st.session_state.model,
-                        top_k=3
-                    )
-                    
-                    context = "\n\n".join(relevant_chunks)
-                    answer = generate_answer(prompt, context, st.session_state.qa_pipeline)
-                    
-                    st.markdown(answer)
-                    st.session_state.chat_history.append(("assistant", answer))
-                    
-                except Exception as e:
-                    error_message = f"❌ Error: {str(e)}"
-                    st.error(error_message)
-                    st.session_state.chat_history.append(("assistant", error_message))
 
-# Clear chat button
-if st.session_state.chat_history:
-    if st.button("🗑️ Clear Chat History"):
-        st.session_state.chat_history = []
-        st.rerun()
+        # Generate assistant response
+        with st.chat_message("assistant"):
+            with st.spinner("Searching documents and thinking..."):
+                relevant_chunks = find_relevant_chunks(
+                    prompt,
+                    st.session_state.chunks,
+                    st.session_state.embeddings,
+                    st.session_state.embedding_model,
+                    top_k=4,
+                )
+                context = "\n\n".join(relevant_chunks)
+                answer = generate_answer(prompt, context, st.session_state.qa_pipeline)
+                st.markdown(answer)
+                st.session_state.chat_history.append(("assistant", answer))
+
+    # Clear chat button
+    if st.session_state.chat_history:
+        if st.button("🗑️ Clear Chat History", use_container_width=True):
+            st.session_state.chat_history = []
+            st.rerun()
