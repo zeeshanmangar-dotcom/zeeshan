@@ -1,11 +1,27 @@
 import streamlit as st
-import pymupdf  # PyMuPDF for PDF processing
 import tempfile
 import os
-from sentence_transformers import SentenceTransformer
-import numpy as np
-from transformers import pipeline
 import re
+import numpy as np
+
+# Lazy imports to handle missing packages gracefully
+try:
+    import pymupdf
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+    
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    
+try:
+    from transformers import pipeline
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
 
 # Page configuration
 st.set_page_config(
@@ -19,6 +35,19 @@ st.markdown("""
 Upload one or more PDF files and chat with an AI assistant about their content.
 The assistant uses semantic search to find relevant content and answer your questions.
 """)
+
+# Check dependencies
+if not all([PYMUPDF_AVAILABLE, SENTENCE_TRANSFORMERS_AVAILABLE, TRANSFORMERS_AVAILABLE]):
+    st.error("⚠️ Missing required packages. Please ensure all dependencies are installed.")
+    missing = []
+    if not PYMUPDF_AVAILABLE:
+        missing.append("PyMuPDF")
+    if not SENTENCE_TRANSFORMERS_AVAILABLE:
+        missing.append("sentence-transformers")
+    if not TRANSFORMERS_AVAILABLE:
+        missing.append("transformers")
+    st.error(f"Missing: {', '.join(missing)}")
+    st.stop()
 
 # Sidebar for file upload
 with st.sidebar:
