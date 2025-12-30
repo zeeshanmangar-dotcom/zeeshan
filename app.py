@@ -1,8 +1,8 @@
-
 import streamlit as st
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_community.llms import HuggingFaceHub
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.schema import HumanMessage, AIMessage
@@ -20,26 +20,11 @@ st.set_page_config(
 st.title("📚 PDF Chat Assistant")
 st.markdown("""
 Upload one or more PDF files and chat with an AI assistant about their content.
-The assistant uses RAG (Retrieval-Augmented Generation) to provide accurate answers based on your documents.
+The assistant uses RAG (Retrieval-Augmented Generation) with free, open-source models to provide accurate answers based on your documents.
 """)
 
-# Sidebar for API key and file upload
+# Sidebar for file upload
 with st.sidebar:
-    st.header("Configuration")
-    
-    # OpenAI API Key input
-    api_key = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        help="Enter your OpenAI API key to use the chatbot"
-    )
-    
-    if api_key:
-        os.environ["OPENAI_API_KEY"] = api_key
-    
-    st.markdown("---")
-    
-    # File uploader
     st.header("Upload PDFs")
     uploaded_files = st.file_uploader(
         "Choose PDF files",
@@ -50,6 +35,15 @@ with st.sidebar:
     
     # Process button
     process_button = st.button("Process PDFs", type="primary", use_container_width=True)
+    
+    st.markdown("---")
+    st.info("""
+    **Note:** This app uses free, open-source models:
+    - Embeddings: sentence-transformers/all-MiniLM-L6-v2
+    - LLM: Google Flan-T5 (running locally)
+    
+    No API key required! The first run may take a moment to download models.
+    """)
 
 # Initialize session state
 if "chat_history" not in st.session_state:
@@ -63,6 +57,47 @@ if "conversation_chain" not in st.session_state:
 
 if "processed_files" not in st.session_state:
     st.session_state.processed_files = []
+
+if "embeddings" not in st.session_state:
+    st.session_state.embeddings = None
+
+if "llm" not in st.session_state:
+    st.session_state.llm = None
+
+
+@st.cache_resource
+def load_embeddings():
+    """Load and cache the embedding model."""
+    try:
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
+        return embeddings
+    except Exception as e:
+        st.error(f"Error loading embeddings: {str(e)}")
+        return None
+
+
+@st.cache_resource
+def load_llm():
+    """Load and cache the language model."""
+    try:
+        from transformers import pipeline
+        
+        # Use a smaller, local model for faster inference
+        qa_pipeline = pipeline(
+            "text2text-generation",
+            model="google/flan-t5-base",
+            max_length=512,
+            device=-1  # CPU
+        )
+        
+        return qa_pipeline
+    except Exception as e:
+        st.error(f"Error loading LLM: {str(e)}")
+        return None
 
 
 def extract_text_from_pdf(pdf_file):
@@ -89,14 +124,14 @@ def extract_text_from_pdf(pdf_file):
         return ""
 
 
-def process_pdfs(files, api_key):
+def process_pdfs(files, embeddings):
     """Process uploaded PDF files and create vector store."""
-    if not api_key:
-        st.error("⚠️ Please enter your OpenAI API key in the sidebar.")
-        return None
-    
     if not files:
         st.error("⚠️ Please upload at least one PDF file.")
+        return None
+    
+    if embeddings is None:
+        st.error("⚠️ Embedding model failed to load.")
         return None
     
     try:
@@ -119,8 +154,8 @@ def process_pdfs(files, api_key):
             
             # Split text into chunks
             text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
+                chunk_size=500,
+                chunk_overlap=50,
                 length_function=len,
                 separators=["\n\n", "\n", " ", ""]
             )
@@ -130,8 +165,7 @@ def process_pdfs(files, api_key):
                 st.error("❌ Could not split text into chunks.")
                 return None
             
-            # Create embeddings and vector store
-            embeddings = OpenAIEmbeddings(openai_api_key=api_key)
+            # Create vector store
             vectorstore = FAISS.from_texts(chunks, embeddings)
             
             st.success(f"✅ Successfully processed {len(file_names)} PDF(s): {', '.join(file_names)}")
@@ -144,48 +178,41 @@ def process_pdfs(files, api_key):
         return None
 
 
-def create_conversation_chain(vectorstore, api_key):
-    """Create a conversational retrieval chain."""
+def generate_answer(question, context, qa_pipeline):
+    """Generate an answer using the QA pipeline."""
     try:
-        # Initialize LLM
-        llm = ChatOpenAI(
-            model_name="gpt-4o-mini",
-            temperature=0.7,
-            openai_api_key=api_key
-        )
-        
-        # Create memory for conversation history
-        memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="answer"
-        )
-        
-        # Create conversational retrieval chain
-        conversation_chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 4}),
-            memory=memory,
-            return_source_documents=True,
-            verbose=False
-        )
-        
-        return conversation_chain
-    
-    except Exception as e:
-        st.error(f"❌ Error creating conversation chain: {str(e)}")
-        return None
+        # Format the prompt for the model
+        prompt = f"""Answer the question based on the context below. If the answer cannot be found in the context, say "I cannot find the answer in the provided documents."
 
+Context: {context}
+
+Question: {question}
+
+Answer:"""
+        
+        # Generate answer
+        result = qa_pipeline(prompt, max_length=512, do_sample=False)
+        answer = result[0]['generated_text']
+        
+        return answer
+    except Exception as e:
+        return f"Error generating answer: {str(e)}"
+
+
+# Load models on first run
+if st.session_state.embeddings is None:
+    with st.spinner("Loading embedding model... (first time only)"):
+        st.session_state.embeddings = load_embeddings()
+
+if st.session_state.llm is None:
+    with st.spinner("Loading language model... (first time only)"):
+        st.session_state.llm = load_llm()
 
 # Process PDFs when button is clicked
 if process_button:
-    result = process_pdfs(uploaded_files, api_key)
+    result = process_pdfs(uploaded_files, st.session_state.embeddings)
     if result:
         st.session_state.vectorstore, st.session_state.processed_files = result
-        st.session_state.conversation_chain = create_conversation_chain(
-            st.session_state.vectorstore,
-            api_key
-        )
         # Clear chat history when processing new PDFs
         st.session_state.chat_history = []
 
@@ -196,10 +223,11 @@ st.markdown("---")
 if st.session_state.vectorstore is None:
     st.info("""
     👈 **Get Started:**
-    1. Enter your OpenAI API key in the sidebar
-    2. Upload one or more PDF files
-    3. Click "Process PDFs"
-    4. Start chatting about your documents!
+    1. Upload one or more PDF files
+    2. Click "Process PDFs"
+    3. Start chatting about your documents!
+    
+    ⚡ **Note:** The first run will download required models (~400MB). This happens once and future runs will be faster.
     """)
 else:
     st.success(f"📄 Currently chatting about: {', '.join(st.session_state.processed_files)}")
@@ -215,8 +243,8 @@ for message in st.session_state.chat_history:
 
 # Chat input
 if prompt := st.chat_input("Ask a question about your PDFs...", disabled=(st.session_state.vectorstore is None)):
-    if not api_key:
-        st.error("⚠️ Please enter your OpenAI API key in the sidebar.")
+    if st.session_state.llm is None:
+        st.error("⚠️ Language model failed to load. Please refresh the page.")
     else:
         # Add user message to chat history
         st.session_state.chat_history.append(HumanMessage(content=prompt))
@@ -229,12 +257,15 @@ if prompt := st.chat_input("Ask a question about your PDFs...", disabled=(st.ses
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    # Get response from conversation chain
-                    response = st.session_state.conversation_chain({
-                        "question": prompt
-                    })
+                    # Retrieve relevant documents
+                    retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
+                    docs = retriever.get_relevant_documents(prompt)
                     
-                    answer = response["answer"]
+                    # Combine context from retrieved documents
+                    context = "\n\n".join([doc.page_content for doc in docs])
+                    
+                    # Generate answer
+                    answer = generate_answer(prompt, context, st.session_state.llm)
                     
                     # Display answer
                     st.markdown(answer)
